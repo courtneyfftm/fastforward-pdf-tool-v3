@@ -1,4 +1,6 @@
 import os
+import base64
+import fitz
 import json
 import re
 import tempfile
@@ -80,7 +82,24 @@ def extract_text_from_pdf(pdf_path):
     except:
         return ""
 
-def analyze_document(text, filename):
+def render_pdf_pages(pdf_path):
+    """Render each PDF page to a PNG image for visual document analysis."""
+    page_images = []
+
+    with fitz.open(pdf_path) as pdf:
+        for page_number, page in enumerate(pdf):
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.8, 1.8), alpha=False)
+            image_path = os.path.join(
+                app.config["UPLOAD_FOLDER"],
+                f"pdf_page_{os.getpid()}_{page_number}.png"
+            )
+            pix.save(image_path)
+            page_images.append(image_path)
+
+    return page_images
+
+
+def analyze_document(text, filename, image_path=None):
     """Classify a document and extract transaction data in ONE OpenAI request."""
     if not client:
         return "Unknown", {}
@@ -89,11 +108,11 @@ def analyze_document(text, filename):
         return "Unknown", {}
 
     try:
-        response = client.responses.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-6-astra"),
-            input=f"""You are a real estate transaction document analyzer.
+        prompt_text = f"""You are a real estate transaction document analyzer.
 
-Analyze this document and return ONLY valid JSON in this exact structure:
+Analyze this document using BOTH the extracted text and the page image when provided. The page image is authoritative for handwritten information, checkboxes, printed form fields, and values that may have been corrupted during text extraction.
+
+Return ONLY valid JSON in this exact structure:
 {{
   "document_type": "one allowed document type",
   "transaction_data": {{
@@ -122,15 +141,51 @@ Allowed document_type values:
 Rules:
 - Use only information actually present in the document.
 - Never guess or invent information.
-- Leave a transaction_data field as an empty string when it is not found.
+- Use the entire extracted text provided.
+- Also inspect the page image carefully when one is provided.
+- For handwritten or visually marked fields, use what is visibly written or selected on the page.
+- Purchase price may appear as Purchase Price, Sales Price, Contract Price, or Total Purchase Price.
+- Earnest money may appear as Earnest Money, Earnest Money Deposit, Deposit, or EMD.
+- Closing date may appear as Closing Date, Date of Closing, or Closing.
+- Financing type may appear as Financing, Method of Financing, Loan, Mortgage, Cash, Conventional, FHA, VA, USDA, or similar.
+- Buyer names may appear as Buyer, Purchaser, or Purchasers.
+- Seller names may appear as Seller, Owner, or Sellers.
+- Property address may appear as Property Address, Premises, Property, or the address associated with the transaction.
+- If a field is clearly present anywhere in the document or visible in the image, extract it.
+- If multiple values appear, choose the value that applies to the transaction represented by this document.
+- Leave a transaction_data field as an empty string only when the information cannot be found.
 - Return JSON only. No markdown fences. No explanation.
 
 Filename: {filename}
 
-Document text:
-{text[:2500]}"""
-        )
+Extracted document text:
+{text[:12000]}"""
 
+        content = [
+            {
+                "type": "input_text",
+                "text": prompt_text
+            }
+        ]
+
+        if image_path and os.path.exists(image_path):
+            with open(image_path, "rb") as image_file:
+                image_b64 = base64.b64encode(image_file.read()).decode("utf-8")
+
+            content.append({
+                "type": "input_image",
+                "image_url": f"data:image/png;base64,{image_b64}"
+            })
+
+        response = client.responses.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-6-astra"),
+            input=[
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ]
+        )
         raw = response.output_text.strip()
 
         # Remove accidental markdown JSON fences if a model adds them.
@@ -229,7 +284,9 @@ def upload_file():
         
         for i, doc in enumerate(documents):
             text = extract_text_from_pdf(doc['path'])
-            doc_type, data = analyze_document(text, doc['filename'])
+            page_images = render_pdf_pages(doc['path'])
+            image_path = page_images[0] if page_images else None
+            doc_type, data = analyze_document(text, doc['filename'], image_path)
 
             doc['type'] = doc_type
             documents_with_types.append(doc)
