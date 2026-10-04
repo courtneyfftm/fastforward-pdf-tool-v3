@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import tempfile
 import zipfile
 from flask import Flask, render_template, request, jsonify, send_file
@@ -170,6 +171,20 @@ def extract_transaction_data(pdf_path, doc_type):
     text = extract_text_from_pdf(pdf_path)
     _, transaction_data = analyze_document(text, os.path.basename(pdf_path))
     return transaction_data
+
+
+def sort_documents(documents_with_types):
+    """Sort documents according to the preferred transaction document order."""
+    priority_map = {doc_type: idx for idx, doc_type in enumerate(DOCUMENT_ORDER)}
+
+    def get_priority(doc):
+        doc_type = str(doc.get("type", "Other")).lower()
+        for keyword, priority in priority_map.items():
+            if keyword in doc_type:
+                return priority
+        return len(DOCUMENT_ORDER)
+
+    return sorted(documents_with_types, key=get_priority)
 
 
 @app.route('/')
