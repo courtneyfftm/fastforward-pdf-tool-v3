@@ -132,3 +132,9 @@ In Render → Environment, add:
 - `OPENAI_MODEL` = `gpt-6-astra` (optional; this is the default)
 
 Keep the API key in Render. Do not put it in the webpage, source code, or Git repository.
+
+
+## Performance / timeout
+
+The app now uses one OpenAI request per PDF page for both classification and transaction-data extraction.
+Gunicorn is configured with a 300-second worker timeout and one worker to reduce memory pressure on small Render instances.

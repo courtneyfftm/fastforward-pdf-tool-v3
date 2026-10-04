@@ -79,15 +79,34 @@ def extract_text_from_pdf(pdf_path):
     except:
         return ""
 
-def classify_document(text, filename):
-    """Use OpenAI to classify document type."""
+def analyze_document(text, filename):
+    """Classify a document and extract transaction data in ONE OpenAI request."""
     if not client:
-        return "Unknown"
+        return "Unknown", {}
+
+    if not text or len(text.strip()) < 10:
+        return "Unknown", {}
 
     try:
         response = client.responses.create(
             model=os.getenv("OPENAI_MODEL", "gpt-6-astra"),
-            input=f"""Based on this document text, classify it as ONE of these types:
+            input=f"""You are a real estate transaction document analyzer.
+
+Analyze this document and return ONLY valid JSON in this exact structure:
+{{
+  "document_type": "one allowed document type",
+  "transaction_data": {{
+    "closing_date": "",
+    "earnest_money_amount": "",
+    "purchase_price": "",
+    "financing_type": "",
+    "buyer_names": "",
+    "seller_names": "",
+    "property_address": ""
+  }}
+}}
+
+Allowed document_type values:
 - Pre-Approval Letter
 - Proof of Funds
 - Agency Disclosure
@@ -99,72 +118,59 @@ def classify_document(text, filename):
 - Affiliated Business Arrangement
 - Other
 
-Document filename: {filename}
+Rules:
+- Use only information actually present in the document.
+- Never guess or invent information.
+- Leave a transaction_data field as an empty string when it is not found.
+- Return JSON only. No markdown fences. No explanation.
 
-Document text (first 500 chars):
-{text[:500]}
+Filename: {filename}
 
-Respond with ONLY the classification name, nothing else."""
+Document text:
+{text[:2500]}"""
         )
-        return response.output_text.strip()
-    except Exception:
-        app.logger.exception("OpenAI document classification failed")
-        raise RuntimeError("OpenAI document classification failed. Check the Render logs for details.")
 
-def sort_documents(documents_with_types):
-    """Sort documents according to preferred order"""
-    priority_map = {doc_type: idx for idx, doc_type in enumerate(DOCUMENT_ORDER)}
-    
-    def get_priority(doc):
-        doc_type = doc['type'].lower()
-        for keyword, priority in priority_map.items():
-            if keyword in doc_type.lower():
-                return priority
-        return len(DOCUMENT_ORDER)  # Unknown docs go to end
-    
-    return sorted(documents_with_types, key=get_priority)
+        raw = response.output_text.strip()
+
+        # Remove accidental markdown JSON fences if a model adds them.
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"\s*```$", "", raw)
+
+        result = json.loads(raw)
+
+        document_type = str(result.get("document_type", "Other")).strip() or "Other"
+        transaction_data = result.get("transaction_data") or {}
+
+        if not isinstance(transaction_data, dict):
+            transaction_data = {}
+
+        cleaned_data = {}
+        for key, value in transaction_data.items():
+            if value is not None and str(value).strip():
+                cleaned_data[str(key).strip()] = str(value).strip()
+
+        return document_type, cleaned_data
+
+    except Exception:
+        app.logger.exception("OpenAI document analysis failed for %s", filename)
+        raise RuntimeError(
+            "OpenAI document analysis failed. Check the Render logs for details."
+        )
+
+
+def classify_document(text, filename):
+    """Compatibility wrapper."""
+    document_type, _ = analyze_document(text, filename)
+    return document_type
+
 
 def extract_transaction_data(pdf_path, doc_type):
-    """Extract key transaction data from document using OpenAI."""
-    if not client:
-        return {}
-
+    """Compatibility wrapper."""
     text = extract_text_from_pdf(pdf_path)
-    if not text or len(text) < 10:
-        return {}
+    _, transaction_data = analyze_document(text, os.path.basename(pdf_path))
+    return transaction_data
 
-    try:
-        response = client.responses.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-6-astra"),
-            input=f"""From this {doc_type} document, extract any of these if found:
-- Closing date
-- Earnest money amount
-- Purchase price
-- Financing type
-- Buyer name(s)
-- Seller name(s)
-- Property address
-
-Document: {text[:2000]}
-
-List each found item on a new line as: KEY: VALUE"""
-        )
-
-        response_text = response.output_text.strip()
-
-        data = {}
-        for line in response_text.split("\n"):
-            if ":" in line:
-                key, value = line.split(":", 1)
-                key = key.strip().lower().replace(" ", "_")
-                value = value.strip()
-                if value and value.lower() != "not found":
-                    data[key] = value
-
-        return data
-    except Exception:
-        app.logger.exception("OpenAI transaction data extraction failed")
-        raise RuntimeError("OpenAI transaction data extraction failed. Check the Render logs for details.")
 
 @app.route('/')
 def index():
@@ -208,18 +214,16 @@ def upload_file():
         
         for i, doc in enumerate(documents):
             text = extract_text_from_pdf(doc['path'])
-            doc_type = classify_document(text, doc['filename'])
+            doc_type, data = analyze_document(text, doc['filename'])
+
             doc['type'] = doc_type
             documents_with_types.append(doc)
-            
-            # Extract data from relevant documents
-            data = extract_transaction_data(doc['path'], doc_type)
-            if data and 'error' not in data:
+
+            if data:
                 for key, value in data.items():
-                    if value and value != 'null':
-                        if key not in transaction_data:
-                            transaction_data[key] = value
-        
+                    if value and value != 'null' and key not in transaction_data:
+                        transaction_data[key] = value
+
         # Sort documents
         sorted_docs = sort_documents(documents_with_types)
         
